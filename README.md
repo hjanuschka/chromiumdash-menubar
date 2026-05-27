@@ -10,6 +10,10 @@ Data sources:
 
 Inspired by Chromium issue: https://issues.chromium.org/issues/515480635
 
+## Screenshot
+
+![Chromium Branches menu bar screenshot](docs/screenshot.png)
+
 ## Install
 
 Download the latest macOS zip from:
