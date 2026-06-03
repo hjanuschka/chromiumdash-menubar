@@ -45,6 +45,7 @@ final class ChromiumDataService {
 
             var result: [ChannelInfo] = []
             for try await item in group { result.append(item) }
+            result = try await self.adjustCanaryMilestone(result)
             return result.sorted { channelOrder($0.name) < channelOrder($1.name) }
         }
     }
@@ -54,6 +55,29 @@ final class ChromiumDataService {
         let milestone = Int(version.split(separator: ".").first ?? "0") ?? 0
         let schedule = try? await fetchSchedule(milestone)
         return ChannelInfo(name: channel, version: version, milestone: milestone, schedule: schedule)
+    }
+
+    private func adjustCanaryMilestone(_ channels: [ChannelInfo]) async throws -> [ChannelInfo] {
+        guard let dev = channels.first(where: { $0.name == "dev" }),
+              let canary = channels.first(where: { $0.name == "canary" }),
+              dev.milestone == canary.milestone,
+              hasBranched(dev.schedule?.branch_point) else {
+            return channels
+        }
+
+        let nextMilestone = dev.milestone + 1
+        let nextSchedule = try? await fetchSchedule(nextMilestone)
+        return channels.map { channel in
+            if channel.name == "canary" {
+                return ChannelInfo(name: channel.name, version: channel.version, milestone: nextMilestone, schedule: nextSchedule)
+            }
+            return channel
+        }
+    }
+
+    private func hasBranched(_ value: String?) -> Bool {
+        guard let days = daysUntil(value) else { return false }
+        return days <= 0
     }
 
     private func fetchVersion(_ channel: String) async throws -> String {
