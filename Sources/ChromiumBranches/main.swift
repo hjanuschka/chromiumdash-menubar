@@ -136,6 +136,10 @@ private func channelColor(_ name: String) -> NSColor {
 }
 
 private let readableGreen = NSColor(calibratedRed: 0.18, green: 0.55, blue: 0.28, alpha: 1)
+private let timelineBackground = NSColor(calibratedWhite: 0.97, alpha: 1)
+private let timelinePrimaryText = NSColor(calibratedWhite: 0.10, alpha: 1)
+private let timelineSecondaryText = NSColor(calibratedWhite: 0.34, alpha: 1)
+private let timelineMutedText = NSColor(calibratedWhite: 0.52, alpha: 1)
 
 private func coloredTitle(_ text: String, color: NSColor, bold: Bool = false) -> NSAttributedString {
     let font = bold ? NSFont.boldSystemFont(ofSize: NSFont.systemFontSize) : NSFont.menuFont(ofSize: 0)
@@ -197,6 +201,8 @@ private func branchCountdownText(_ value: String?) -> String {
 
 struct TimelineEvent {
     let date: Date
+    let milestone: Int
+    let channel: String
     let title: String
     let subtitle: String
     let color: NSColor
@@ -206,41 +212,79 @@ final class TimelineView: NSView {
     let events: [TimelineEvent]
 
     init(events: [TimelineEvent]) {
-        self.events = events.sorted { $0.date < $1.date }
-        super.init(frame: NSRect(x: 0, y: 0, width: 520, height: CGFloat(max(150, events.count * 34 + 48))))
+        self.events = events.sorted {
+            if $0.milestone != $1.milestone { return $0.milestone < $1.milestone }
+            return $0.date < $1.date
+        }
+        let milestoneCount = Set(events.map { $0.milestone }).count
+        let height = max(170, events.count * 32 + milestoneCount * 26 + 28)
+        super.init(frame: NSRect(x: 0, y: 0, width: 560, height: CGFloat(height)))
     }
 
     required init?(coder: NSCoder) { nil }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+        timelineBackground.setFill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 8, dy: 4), xRadius: 12, yRadius: 12).fill()
         guard !events.isEmpty else { return }
-        let lineX: CGFloat = 30
-        let top = bounds.maxY - 34
-        let bottom: CGFloat = 22
+        let lineX: CGFloat = 34
+        let top = bounds.maxY - 20
+        let bottom: CGFloat = 18
 
-        NSColor.separatorColor.withAlphaComponent(0.7).setStroke()
+        NSColor(calibratedWhite: 0.78, alpha: 1).setStroke()
         let line = NSBezierPath()
         line.move(to: NSPoint(x: lineX, y: bottom))
-        line.line(to: NSPoint(x: lineX, y: top))
+        line.line(to: NSPoint(x: lineX, y: top - 14))
         line.lineWidth = 2
         line.stroke()
 
-        for (index, event) in events.enumerated() {
-            let y = top - CGFloat(index) * 34
-            event.color.setFill()
-            NSBezierPath(ovalIn: NSRect(x: lineX - 6, y: y - 6, width: 12, height: 12)).fill()
+        var y = top
+        var currentMilestone: Int?
+        for event in events {
+            if currentMilestone != event.milestone {
+                currentMilestone = event.milestone
+                drawMilestoneHeader(event.milestone, y: y)
+                y -= 26
+            }
 
-            let isPast = Calendar.current.startOfDay(for: event.date) < Calendar.current.startOfDay(for: Date())
-            let titleColor = isPast ? NSColor.secondaryLabelColor : NSColor.labelColor
-            let rel = relativeText(inputFormatter.string(from: event.date))
-            let date = shortFormatter.string(from: event.date)
-
-            (event.title as NSString).draw(in: NSRect(x: 52, y: y - 8, width: 185, height: 18), withAttributes: [.font: NSFont.systemFont(ofSize: 13, weight: .semibold), .foregroundColor: titleColor])
-            (event.subtitle as NSString).draw(in: NSRect(x: 238, y: y - 8, width: 90, height: 18), withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .medium), .foregroundColor: event.color])
-            (date as NSString).draw(in: NSRect(x: 330, y: y - 8, width: 90, height: 18), withAttributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular), .foregroundColor: NSColor.secondaryLabelColor])
-            (rel as NSString).draw(in: NSRect(x: 420, y: y - 8, width: 80, height: 18), withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .medium), .foregroundColor: relativeColorStatic(rel)])
+            drawEvent(event, y: y, lineX: lineX)
+            y -= 32
         }
+    }
+
+    private func drawMilestoneHeader(_ milestone: Int, y: CGFloat) {
+        let rect = NSRect(x: 18, y: y - 17, width: 64, height: 20)
+        NSColor(calibratedWhite: 0.88, alpha: 1).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 10, yRadius: 10).fill()
+        ("M\(milestone)" as NSString).draw(in: NSRect(x: 34, y: y - 14, width: 42, height: 16), withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .bold), .foregroundColor: timelinePrimaryText])
+    }
+
+    private func drawEvent(_ event: TimelineEvent, y: CGFloat, lineX: CGFloat) {
+        let today = Calendar.current.startOfDay(for: Date())
+        let eventDay = Calendar.current.startOfDay(for: event.date)
+        let isToday = eventDay == today
+        let isPast = eventDay < today
+
+        if isToday {
+            NSColor(calibratedRed: 0.86, green: 0.92, blue: 1.0, alpha: 1).setFill()
+            NSBezierPath(roundedRect: NSRect(x: 14, y: y - 12, width: 522, height: 24), xRadius: 8, yRadius: 8).fill()
+            ("TODAY" as NSString).draw(in: NSRect(x: 482, y: y - 8, width: 48, height: 16), withAttributes: [.font: NSFont.systemFont(ofSize: 10, weight: .bold), .foregroundColor: channelColor("beta")])
+        }
+
+        event.color.setFill()
+        NSBezierPath(ovalIn: NSRect(x: lineX - 6, y: y - 6, width: 12, height: 12)).fill()
+
+        let titleColor = isPast ? timelineMutedText : timelinePrimaryText
+        let rel = relativeText(inputFormatter.string(from: event.date))
+        let date = shortFormatter.string(from: event.date)
+        let channelText = displayName(event.channel)
+
+        (event.title as NSString).draw(in: NSRect(x: 56, y: y - 8, width: 154, height: 18), withAttributes: [.font: NSFont.systemFont(ofSize: 13, weight: .semibold), .foregroundColor: titleColor])
+        (channelText as NSString).draw(in: NSRect(x: 214, y: y - 8, width: 66, height: 18), withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .bold), .foregroundColor: highContrastChannelColor(event.channel)])
+        (event.subtitle as NSString).draw(in: NSRect(x: 284, y: y - 8, width: 62, height: 18), withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: timelineSecondaryText])
+        (date as NSString).draw(in: NSRect(x: 350, y: y - 8, width: 92, height: 18), withAttributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium), .foregroundColor: timelineSecondaryText])
+        (rel as NSString).draw(in: NSRect(x: 444, y: y - 8, width: 76, height: 18), withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .bold), .foregroundColor: highContrastRelativeColor(rel)])
     }
 }
 
@@ -249,6 +293,23 @@ private func relativeColorStatic(_ text: String) -> NSColor {
     if text.hasPrefix("in ") { return readableGreen }
     if text == "TBD" { return NSColor.secondaryLabelColor }
     return NSColor.tertiaryLabelColor
+}
+
+private func highContrastRelativeColor(_ text: String) -> NSColor {
+    if text == "today" || text == "tomorrow" { return NSColor(calibratedRed: 0.72, green: 0.30, blue: 0.06, alpha: 1) }
+    if text.hasPrefix("in ") { return NSColor(calibratedRed: 0.10, green: 0.44, blue: 0.20, alpha: 1) }
+    if text == "TBD" { return timelineMutedText }
+    return timelineMutedText
+}
+
+private func highContrastChannelColor(_ name: String) -> NSColor {
+    switch name {
+    case "stable": return NSColor(calibratedRed: 0.08, green: 0.42, blue: 0.18, alpha: 1)
+    case "beta": return NSColor(calibratedRed: 0.08, green: 0.26, blue: 0.65, alpha: 1)
+    case "dev": return NSColor(calibratedRed: 0.62, green: 0.28, blue: 0.04, alpha: 1)
+    case "canary": return NSColor(calibratedRed: 0.55, green: 0.38, blue: 0.02, alpha: 1)
+    default: return timelineSecondaryText
+    }
 }
 
 final class CardBackgroundView: NSView {
@@ -455,7 +516,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if let next = nextTimelineEvent() {
-            insights.append("Next schedule event: \(next.title) on \(dateText(inputFormatter.string(from: next.date))) (\(relativeText(inputFormatter.string(from: next.date)))).")
+            insights.append("Next schedule event: M\(next.milestone) \(displayName(next.channel)) \(next.title.lowercased()) on \(dateText(inputFormatter.string(from: next.date))) (\(relativeText(inputFormatter.string(from: next.date)))).")
         }
 
         if insights.isEmpty {
@@ -642,22 +703,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func timelineMenuItem() -> NSMenuItem {
         let events = timelineEvents()
         let item = NSMenuItem()
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: CGFloat(max(180, events.count * 34 + 82))))
+        let milestoneCount = Set(events.map { $0.milestone }).count
+        let containerHeight = CGFloat(max(210, events.count * 32 + milestoneCount * 26 + 88))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: containerHeight))
 
         let title = NSTextField(labelWithString: "Chrome release schedule")
         title.frame = NSRect(x: 18, y: container.bounds.maxY - 32, width: 300, height: 20)
         title.font = NSFont.systemFont(ofSize: 16, weight: .bold)
-        title.textColor = NSColor.labelColor
+        title.textColor = timelinePrimaryText
         container.addSubview(title)
 
         let hint = NSTextField(labelWithString: "Branch, beta, stable, and refresh dates from ChromiumDash")
-        hint.frame = NSRect(x: 18, y: container.bounds.maxY - 52, width: 420, height: 16)
-        hint.font = NSFont.systemFont(ofSize: 12, weight: .regular)
-        hint.textColor = NSColor.secondaryLabelColor
+        hint.frame = NSRect(x: 18, y: container.bounds.maxY - 52, width: 500, height: 16)
+        hint.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        hint.textColor = timelineSecondaryText
         container.addSubview(hint)
 
         let timeline = TimelineView(events: events)
-        timeline.frame = NSRect(x: 0, y: 0, width: 520, height: container.bounds.height - 56)
+        timeline.frame = NSRect(x: 0, y: 0, width: 560, height: container.bounds.height - 56)
         container.addSubview(timeline)
 
         item.view = container
@@ -670,13 +733,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let latestPast = Calendar.current.date(byAdding: .day, value: -10, to: today) ?? today
         let latestFuture = Calendar.current.date(byAdding: .day, value: 90, to: today) ?? today
 
-        for channel in channels.sorted(by: { channelOrder($0.name) < channelOrder($1.name) }) {
+        let visible = visibleMenuBarChannels()
+        for channel in channels.filter({ visible.contains($0.name) }).sorted(by: { channelOrder($0.name) < channelOrder($1.name) }) {
             let color = channelColor(channel.name)
-            let prefix = "M\(channel.milestone) \(displayName(channel.name))"
-            appendEvent(&result, date: parseDate(channel.schedule?.branch_point), title: "\(prefix) branches", subtitle: "branch", color: color)
-            appendEvent(&result, date: parseDate(channel.schedule?.earliest_beta), title: "\(prefix) enters Beta", subtitle: "beta", color: channelColor("beta"))
-            appendEvent(&result, date: parseDate(channel.schedule?.stable_date), title: "\(prefix) Stable release", subtitle: "stable", color: channelColor("stable"))
-            appendEvent(&result, date: parseDate(channel.schedule?.stable_refresh_first), title: "\(prefix) refresh 1", subtitle: "refresh", color: readableGreen)
+            appendEvent(&result, channel: channel, date: parseDate(channel.schedule?.branch_point), title: "Branch point", subtitle: "branch", color: color)
+            appendEvent(&result, channel: channel, date: parseDate(channel.schedule?.earliest_beta), title: "Beta starts", subtitle: "beta", color: channelColor("beta"))
+            appendEvent(&result, channel: channel, date: parseDate(channel.schedule?.stable_date), title: "Stable release", subtitle: "stable", color: channelColor("stable"))
+            appendEvent(&result, channel: channel, date: parseDate(channel.schedule?.stable_refresh_first), title: "Stable refresh", subtitle: "refresh", color: readableGreen)
         }
 
         return result
@@ -684,9 +747,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sorted { $0.date < $1.date }
     }
 
-    private func appendEvent(_ events: inout [TimelineEvent], date: Date?, title: String, subtitle: String, color: NSColor) {
+    private func appendEvent(_ events: inout [TimelineEvent], channel: ChannelInfo, date: Date?, title: String, subtitle: String, color: NSColor) {
         guard let date else { return }
-        events.append(TimelineEvent(date: date, title: title, subtitle: subtitle, color: color))
+        events.append(TimelineEvent(date: date, milestone: channel.milestone, channel: channel.name, title: title, subtitle: subtitle, color: color))
     }
 
     private func addMilestoneSummary(to menu: NSMenu) {
