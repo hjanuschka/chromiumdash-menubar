@@ -32,6 +32,116 @@ struct ChannelInfo {
     let schedule: Milestone?
 }
 
+struct GerritAccount: Decodable {
+    let name: String?
+    let email: String?
+    let username: String?
+}
+
+struct GerritMessage: Decodable {
+    let date: String
+    let message: String
+    let author: GerritAccount?
+}
+
+struct GerritChange: Decodable {
+    let changeNumber: Int
+    let subject: String
+    let status: String
+    let branch: String
+    let updated: String
+    let owner: GerritAccount?
+    let messages: [GerritMessage]?
+    let submittable: Bool?
+    let mergeable: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case changeNumber = "_number"
+        case subject
+        case status
+        case branch
+        case updated
+        case owner
+        case messages
+        case submittable
+        case mergeable
+    }
+}
+
+struct GerritMergeable: Decodable {
+    let mergeable: Bool
+}
+
+struct IssueInfo {
+    let id: String
+    let title: String
+    let updated: String
+}
+
+struct GerritTarget {
+    let host: String
+    let project: String
+    let id: String
+
+    init(_ bookmark: String) {
+        let parts = bookmark.split(separator: ":", maxSplits: 2).map(String.init)
+        if parts.count == 3 {
+            host = parts[0]
+            project = parts[1]
+            id = parts[2]
+        } else {
+            host = "chromium-review.googlesource.com"
+            project = "chromium/src"
+            id = bookmark
+        }
+    }
+
+    var displayID: String { id }
+    var displayProject: String { project }
+    var url: String { "https://\(host)/c/\(project)/+/\(id)" }
+}
+
+final class GerritService {
+    private let session = URLSession.shared
+    private let decoder = JSONDecoder()
+
+    func loadChange(_ bookmark: String) async throws -> GerritChange {
+        let target = GerritTarget(bookmark)
+        let encodedProject = target.project.replacingOccurrences(of: "/", with: "%2F")
+        let url = URL(string: "https://\(target.host)/changes/\(encodedProject)~\(target.id)/detail?o=MESSAGES&o=DETAILED_ACCOUNTS&o=SUBMITTABLE&o=LABELS")!
+        let (data, response) = try await session.data(from: url)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw NSError(domain: "ChromiumBranches", code: 3, userInfo: [NSLocalizedDescriptionKey: "Could not load CL \(target.id)"])
+        }
+        let detailText = stripXSSIPrefix(String(decoding: data, as: UTF8.self))
+        let detail = try decoder.decode(GerritChange.self, from: Data(detailText.utf8))
+        let mergeable = try? await loadMergeable(target, encodedProject: encodedProject)
+        return GerritChange(
+            changeNumber: detail.changeNumber,
+            subject: detail.subject,
+            status: detail.status,
+            branch: detail.branch,
+            updated: detail.updated,
+            owner: detail.owner,
+            messages: detail.messages,
+            submittable: detail.submittable,
+            mergeable: mergeable
+        )
+    }
+
+    private func loadMergeable(_ target: GerritTarget, encodedProject: String) async throws -> Bool {
+        let url = URL(string: "https://\(target.host)/changes/\(encodedProject)~\(target.id)/revisions/current/mergeable")!
+        let (data, response) = try await session.data(from: url)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return true }
+        let text = stripXSSIPrefix(String(decoding: data, as: UTF8.self))
+        return try decoder.decode(GerritMergeable.self, from: Data(text.utf8)).mergeable
+    }
+
+    private func stripXSSIPrefix(_ text: String) -> String {
+        text.hasPrefix(")]}'") ? String(text.dropFirst(5)) : text
+    }
+}
+
 final class ChromiumDataService {
     private let session = URLSession.shared
     private let jsonDecoder = JSONDecoder()
@@ -351,15 +461,23 @@ final class CardBackgroundView: NSView {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let service = ChromiumDataService()
+    private let gerritService = GerritService()
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var channels: [ChannelInfo] = []
+    private var clInfos: [String: GerritChange] = [:]
+    private var clErrors: [String: String] = [:]
+    private var issueInfos: [String: IssueInfo] = [:]
+    private var issueErrors: [String: String] = [:]
     private var lastUpdated: Date?
     private var refreshTimer: Timer?
     private let visibleChannelsKey = "visibleMenuBarChannels"
+    private let clBookmarksKey = "clBookmarks"
+    private let issueBookmarksKey = "issueBookmarks"
     private let defaultVisibleChannels: Set<String> = ["stable", "beta", "dev", "canary"]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        installEditMenu()
         statusItem.button?.title = "Cr ..."
         statusItem.button?.toolTip = "Chromium branch/channel schedule"
         rebuildMenu(loading: true, error: nil)
@@ -369,12 +487,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func installEditMenu() {
+        let mainMenu = NSMenu()
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
+        editMenu.addItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
+        editMenu.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
+        editMenu.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+        NSApp.mainMenu = mainMenu
+    }
+
     private func refresh() {
         statusItem.button?.title = "Cr ..."
         rebuildMenu(loading: true, error: nil)
         Task {
             do {
                 channels = try await service.load()
+                await refreshBookmarks(rebuild: false)
                 lastUpdated = Date()
                 updateTitle()
                 rebuildMenu(loading: false, error: nil)
@@ -457,6 +595,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             addScheduleTimeline(to: menu)
             addMilestoneSummary(to: menu)
         }
+
+        menu.addItem(.separator())
+        addCLStatusSection(to: menu)
 
         menu.addItem(.separator())
         addMenuBarVisibilitySection(to: menu)
@@ -763,6 +904,253 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func addCLStatusSection(to menu: NSMenu) {
+        let root = NSMenuItem(title: "CL Status", action: nil, keyEquivalent: "")
+        root.attributedTitle = coloredTitle("CL Status", color: NSColor.labelColor, bold: true)
+        let submenu = NSMenu()
+        submenu.addItem(NSMenuItem(title: "Add CL or Issue...", action: #selector(addStatusBookmark), keyEquivalent: ""))
+        if !clBookmarks().isEmpty || !issueBookmarks().isEmpty {
+            submenu.addItem(NSMenuItem(title: "Refresh Bookmarks", action: #selector(refreshBookmarksNow), keyEquivalent: ""))
+            submenu.addItem(.separator())
+            for id in clBookmarks() {
+                addCLBookmarkItem(id, to: submenu)
+            }
+            for id in issueBookmarks() {
+                addIssueBookmarkItem(id, to: submenu)
+            }
+        }
+        root.submenu = submenu
+        menu.addItem(root)
+    }
+
+    private func addCLBookmarkItem(_ id: String, to menu: NSMenu) {
+        let target = GerritTarget(id)
+        let title: String
+        if let info = clInfos[id] {
+            title = "CL \(target.displayID): \(clDisplayStatus(info)) - \(info.subject)"
+        } else if let error = clErrors[id] {
+            title = "CL \(target.displayID): error - \(error)"
+        } else {
+            title = "CL \(target.displayID): loading"
+        }
+
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.attributedTitle = statusMenuTitle(kind: "CL", id: target.displayID, title: title, color: clInfos[id].map { clStatusColor($0) } ?? NSColor.secondaryLabelColor)
+        let submenu = NSMenu()
+        if let info = clInfos[id] {
+            submenu.addItem(detailItem(label: "Status", value: clDisplayStatus(info), meta: nil, valueColor: clStatusColor(info), boldValue: true))
+            submenu.addItem(detailItem(label: "Gerrit state", value: info.status, meta: nil))
+            submenu.addItem(detailItem(label: "Updated", value: prettyGerritDate(info.updated), meta: nil))
+            submenu.addItem(detailItem(label: "Project", value: target.displayProject, meta: nil))
+            submenu.addItem(detailItem(label: "Branch", value: info.branch, meta: nil))
+            submenu.addItem(detailItem(label: "Owner", value: accountName(info.owner), meta: nil))
+            submenu.addItem(messageItem(title: info.subject, body: latestMessageText(info)))
+        } else if let error = clErrors[id] {
+            submenu.addItem(messageItem(title: "Could not load CL", body: error))
+        } else {
+            submenu.addItem(disabled("Loading..."))
+        }
+        submenu.addItem(.separator())
+        let open = NSMenuItem(title: "Open in Gerrit", action: #selector(openCL(_:)), keyEquivalent: "")
+        open.target = self
+        open.representedObject = id
+        submenu.addItem(open)
+        let remove = NSMenuItem(title: "Remove Bookmark", action: #selector(removeCLBookmark(_:)), keyEquivalent: "")
+        remove.target = self
+        remove.representedObject = id
+        submenu.addItem(remove)
+        item.submenu = submenu
+        menu.addItem(item)
+    }
+
+    private func addIssueBookmarkItem(_ id: String, to menu: NSMenu) {
+        let title: String
+        if let info = issueInfos[id] {
+            title = "Issue \(id): \(info.title)"
+        } else if let error = issueErrors[id] {
+            title = "Issue \(id): error - \(error)"
+        } else {
+            title = "Issue \(id): loading"
+        }
+
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.attributedTitle = statusMenuTitle(kind: "Issue", id: id, title: title, color: channelColor("dev"))
+        let submenu = NSMenu()
+        if let info = issueInfos[id] {
+            submenu.addItem(detailItem(label: "Status", value: "Bookmarked", meta: nil, valueColor: channelColor("dev"), boldValue: true))
+            submenu.addItem(detailItem(label: "Updated", value: info.updated, meta: nil))
+            submenu.addItem(messageItem(title: "Issue \(id)", body: info.title))
+        } else if let error = issueErrors[id] {
+            submenu.addItem(messageItem(title: "Could not load issue", body: error))
+        } else {
+            submenu.addItem(disabled("Loading..."))
+        }
+        submenu.addItem(.separator())
+        let open = NSMenuItem(title: "Open in Issues", action: #selector(openIssueBookmark(_:)), keyEquivalent: "")
+        open.target = self
+        open.representedObject = id
+        submenu.addItem(open)
+        let remove = NSMenuItem(title: "Remove Bookmark", action: #selector(removeIssueBookmark(_:)), keyEquivalent: "")
+        remove.target = self
+        remove.representedObject = id
+        submenu.addItem(remove)
+        item.submenu = submenu
+        menu.addItem(item)
+    }
+
+    private func statusMenuTitle(kind: String, id: String, title: String, color: NSColor) -> NSAttributedString {
+        let result = NSMutableAttributedString(string: "● \(title)", attributes: [.foregroundColor: NSColor.labelColor, .font: NSFont.menuFont(ofSize: 0)])
+        result.addAttribute(.foregroundColor, value: color, range: NSRange(location: 0, length: 1))
+        result.addAttribute(.font, value: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize), range: (result.string as NSString).range(of: "\(kind) \(id)"))
+        return result
+    }
+
+    private func messageItem(title: String, body: String) -> NSMenuItem {
+        let item = NSMenuItem()
+        let width: CGFloat = 500
+        let text = body.isEmpty ? "No messages yet." : body
+        let bodyHeight = heightForInsight(text, width: width) + 12
+        let height = max(CGFloat(70), bodyHeight + 32)
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+
+        let titleField = NSTextField(labelWithString: title)
+        titleField.frame = NSRect(x: 14, y: height - 26, width: width - 28, height: 18)
+        titleField.font = NSFont.systemFont(ofSize: 13, weight: .bold)
+        titleField.textColor = NSColor.labelColor
+        titleField.lineBreakMode = .byTruncatingTail
+        view.addSubview(titleField)
+
+        let bodyField = NSTextField(wrappingLabelWithString: text)
+        bodyField.frame = NSRect(x: 14, y: 8, width: width - 28, height: height - 38)
+        bodyField.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+        bodyField.textColor = NSColor.secondaryLabelColor
+        view.addSubview(bodyField)
+
+        item.view = view
+        return item
+    }
+
+    private func latestMessageText(_ info: GerritChange) -> String {
+        guard let message = info.messages?.last else { return "No messages yet." }
+        let author = accountName(message.author)
+        let text = message.message.replacingOccurrences(of: "\n\n", with: "\n")
+        return "\(author), \(prettyGerritDate(message.date))\n\(text)"
+    }
+
+    private func accountName(_ account: GerritAccount?) -> String {
+        account?.name ?? account?.email ?? account?.username ?? "unknown"
+    }
+
+    private func clDisplayStatus(_ info: GerritChange) -> String {
+        switch info.status.uppercased() {
+        case "MERGED": return "MERGED"
+        case "ABANDONED": return "ABANDONED"
+        default:
+            if info.mergeable == false { return "MERGE CONFLICT" }
+            if info.submittable == true { return "SUBMITTABLE" }
+            return "ACTIVE"
+        }
+    }
+
+    private func clStatusColor(_ info: GerritChange) -> NSColor {
+        switch clDisplayStatus(info) {
+        case "MERGED", "SUBMITTABLE": return readableGreen
+        case "ABANDONED", "MERGE CONFLICT": return NSColor(calibratedRed: 0.72, green: 0.18, blue: 0.14, alpha: 1)
+        default: return channelColor("beta")
+        }
+    }
+
+    private func prettyGerritDate(_ value: String) -> String {
+        String(value.prefix(10))
+    }
+
+    private func clBookmarks() -> [String] {
+        UserDefaults.standard.array(forKey: clBookmarksKey) as? [String] ?? []
+    }
+
+    private func setCLBookmarks(_ bookmarks: [String]) {
+        UserDefaults.standard.set(bookmarks, forKey: clBookmarksKey)
+    }
+
+    private func issueBookmarks() -> [String] {
+        UserDefaults.standard.array(forKey: issueBookmarksKey) as? [String] ?? []
+    }
+
+    private func setIssueBookmarks(_ bookmarks: [String]) {
+        UserDefaults.standard.set(bookmarks, forKey: issueBookmarksKey)
+    }
+
+    private func extractCLBookmark(_ input: String) -> String? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.allSatisfy({ $0.isNumber }) { return trimmed }
+        if let pdfium = firstRegexGroup(#"pdfium-review\.googlesource\.com/c/pdfium/\+/(\d+)"#, in: trimmed) {
+            return "pdfium-review.googlesource.com:pdfium:\(pdfium)"
+        }
+        if let chromium = firstRegexGroup(#"chromium-review\.googlesource\.com/c/chromium/src/\+/(\d+)"#, in: trimmed) {
+            return chromium
+        }
+        let patterns = [#"/\+/(\d+)"#, #"crrev\.com/c/(\d+)"#, #"/c/[^/]+/\+/(\d+)"#]
+        for pattern in patterns {
+            if let match = firstRegexGroup(pattern, in: trimmed) { return match }
+        }
+        return nil
+    }
+
+    private func extractIssueId(_ input: String) -> String? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let patterns = [#"issues\.chromium\.org/issues/(\d+)"#, #"bugs\.chromium\.org/p/chromium/issues/detail\?id=(\d+)"#, #"crbug\.com/(\d+)"#, #"^issue[: ]*(\d+)$"#]
+        for pattern in patterns {
+            if let match = firstRegexGroup(pattern, in: trimmed) { return match }
+        }
+        return nil
+    }
+
+    private func firstRegexGroup(_ pattern: String, in text: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              let range = Range(match.range(at: 1), in: text) else { return nil }
+        return String(text[range])
+    }
+
+    private func refreshBookmarks(rebuild: Bool) async {
+        await refreshCLBookmarks(rebuild: false)
+        refreshIssueBookmarks()
+        if rebuild { rebuildMenu(loading: false, error: nil) }
+    }
+
+    private func refreshIssueBookmarks() {
+        for id in issueBookmarks() {
+            issueInfos[id] = IssueInfo(id: id, title: "Open Chromium issue \(id) for full details", updated: "online")
+            issueErrors.removeValue(forKey: id)
+        }
+    }
+
+    private func refreshCLBookmarks(rebuild: Bool) async {
+        let ids = clBookmarks()
+        guard !ids.isEmpty else { return }
+        await withTaskGroup(of: (String, GerritChange?, String?).self) { group in
+            for id in ids {
+                group.addTask {
+                    do {
+                        return (id, try await self.gerritService.loadChange(id), nil)
+                    } catch {
+                        return (id, nil, error.localizedDescription)
+                    }
+                }
+            }
+            for await result in group {
+                let (id, change, error) = result
+                if let change {
+                    clInfos[id] = change
+                    clErrors.removeValue(forKey: id)
+                } else {
+                    clErrors[id] = error ?? "Unknown error"
+                }
+            }
+        }
+        if rebuild { rebuildMenu(loading: false, error: nil) }
+    }
+
     private func addMenuBarVisibilitySection(to menu: NSMenu) {
         let title = disabled("Show in menu bar")
         title.attributedTitle = coloredTitle("Show in menu bar", color: NSColor.labelColor, bold: true)
@@ -796,6 +1184,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func refreshNow() { refresh() }
+
+    @objc private func addStatusBookmark() {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Add CL or Issue Bookmark"
+        alert.informativeText = "Paste a CL number, Gerrit URL, crrev.com/c link, or issues.chromium.org URL."
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 460, height: 24))
+        field.placeholderString = "https://chromium-review.googlesource.com/c/chromium/src/+/7941513"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+
+        let paste = NSPasteboard.general.string(forType: .string) ?? ""
+        if extractCLBookmark(paste) != nil || extractIssueId(paste) != nil {
+            field.stringValue = paste
+            field.selectText(nil)
+        }
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        if let id = extractIssueId(field.stringValue) {
+            var bookmarks = issueBookmarks()
+            if !bookmarks.contains(id) {
+                bookmarks.append(id)
+                setIssueBookmarks(bookmarks)
+            }
+        } else if let id = extractCLBookmark(field.stringValue) {
+            var bookmarks = clBookmarks()
+            if !bookmarks.contains(id) {
+                bookmarks.append(id)
+                setCLBookmarks(bookmarks)
+            }
+        } else {
+            return
+        }
+        rebuildMenu(loading: false, error: nil)
+        Task { await refreshBookmarks(rebuild: true) }
+    }
+
+    @objc private func refreshBookmarksNow() {
+        Task { await refreshBookmarks(rebuild: true) }
+    }
+
+    @objc private func openCL(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        NSWorkspace.shared.open(URL(string: GerritTarget(id).url)!)
+    }
+
+    @objc private func removeCLBookmark(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        setCLBookmarks(clBookmarks().filter { $0 != id })
+        clInfos.removeValue(forKey: id)
+        clErrors.removeValue(forKey: id)
+        rebuildMenu(loading: false, error: nil)
+    }
+
+    @objc private func openIssueBookmark(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        NSWorkspace.shared.open(URL(string: "https://issues.chromium.org/issues/\(id)")!)
+    }
+
+    @objc private func removeIssueBookmark(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        setIssueBookmarks(issueBookmarks().filter { $0 != id })
+        issueInfos.removeValue(forKey: id)
+        issueErrors.removeValue(forKey: id)
+        rebuildMenu(loading: false, error: nil)
+    }
 
     @objc private func toggleMenuBarChannel(_ sender: NSMenuItem) {
         guard let name = sender.representedObject as? String else { return }
